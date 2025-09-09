@@ -10,6 +10,8 @@
  *   srun --mpi=pmix -N 1 -n 24 ./global_done_original
  */
 
+ #define _POSIX_C_SOURCE 199309L  /* for clock_gettime */
+
  #include <shmem.h>
  #include <stdio.h>
  #include <stdlib.h>
