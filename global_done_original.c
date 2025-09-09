@@ -1,14 +1,18 @@
 /* global_done_original.c
  *
  * Minimal standalone OpenSHMEM program implementing initiate_global_done()
- * with basic performance metrics logged by the detecting PE(s), plus
- * aggregated per-PE elapsed times (min/max/avg) printed before exit.
+ * with basic performance metrics and aggregated per-PE elapsed times.
+ *
+ * A single startup barrier (after shmem_init) aligns g_start_time across PEs
+ * for crisper timing, without affecting the global-done logic.
  *
  * Compile:
  *   oshcc -O3 -std=c11 -o global_done_original global_done_original.c
  *
  * Run (example with 24 PEs on 1 node via Slurm):
  *   srun --mpi=pmix -N 1 -n 24 ./global_done_original
+ * Or multi-node (e.g., 4 nodes * 24 PEs):
+ *   srun --mpi=pmix -N 4 -n 96 ./global_done_original
  */
 
  #define _POSIX_C_SOURCE 199309L  /* for clock_gettime */
@@ -26,8 +30,8 @@
  }
  
  /* Symmetric state */
- static int    *LOCAL_DONE;   /* allocated with shmem_malloc */
- static double *ELAPSED_MS;   /* each PE writes its own elapsed (ms) */
+ static int    *LOCAL_DONE;   /* -1 = done, 0 = not done (symmetric) */
+ static double *ELAPSED_MS;   /* each PE writes its own elapsed time (ms) */
  
  /* per-PE metrics (local) */
  static double g_start_time = 0.0;
@@ -37,12 +41,12 @@
      int npes = shmem_n_pes();
      double elapsed_ms = (now_sec() - g_start_time) * 1e3;
  
-     /* Minimal: which PE triggered and how long since start */
+     /* who triggered and local wall time since shared start */
      printf("global_done() invoked by PE %d after %.3f ms (npes=%d)\n",
             me, elapsed_ms, npes);
      fflush(stdout);
  
-     /* Terminate the entire program cleanly for all PEs */
+     /* terminate entire job step */
      shmem_global_exit(0);
  }
  
@@ -51,9 +55,7 @@
      int me   = shmem_my_pe();
      int npes = shmem_n_pes();
  
-     /* need extra layer with LOCAL_DONE because some apps require mbs to send messages
-        within the "request" that they are serving, so this keeps the mb active to do that */
- 
+     /* Keep mailbox active while app finishes outstanding sends; mark local done. */
      *LOCAL_DONE = -1;
  
      /* record this PE's elapsed time (ms) at the moment it declares local done */
@@ -112,8 +114,10 @@
  int main(int argc, char **argv) {
      shmem_init();
  
-     /* record a (roughly) common start point per-PE */
+     /* ---- startup barrier ONLY for timing alignment (no impact on logic) ---- */
+     shmem_barrier_all();
      g_start_time = now_sec();
+     /* ----------------------------------------------------------------------- */
  
      /* Allocate symmetric memory */
      LOCAL_DONE = shmem_malloc(sizeof(int));
@@ -124,7 +128,7 @@
      *LOCAL_DONE = 0;
      *ELAPSED_MS = 0.0;
  
-     /* Each PE calls initiate_global_done(); whichever PE finds all done will terminate all */
+     /* Each PE calls initiate_global_done(); whichever detects will terminate all */
      initiate_global_done();
  
      /* If no PE reached global_done() in this call, just finalize normally. */
