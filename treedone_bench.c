@@ -1,17 +1,16 @@
 /* treedone_bench.c
  * OpenSHMEM benchmark: TreeReduce-based global termination vs. Allreduce-based.
  *
+ * Changes (no atomics):
+ *  - Upward reduce uses child->parent slot writes and parent waits with shmem_int_wait_until().
+ *  - Downward broadcast is a k-ary tree: each parent sets GLOBAL_DONE=-1 on its children, not root->all.
+ *  - Per-iteration barriers retained (fair, stable).
+ *
  * Build: oshcc -O3 -std=c11 -D_POSIX_C_SOURCE=199309L treedone_bench.c -o treedone_bench
  * Run  : srun --mpi=pmix -n 8 ./treedone_bench --fanout 3 --iters 20000 --warmup 200
- *
- * Notes:
- * - TreeReduce: parents wait for all children (heap k-ary), then non-root signals parent;
- *               root sets GLOBAL_DONE = -1 everywhere (simple broadcast).
- * - Allreduce : each PE sets local "done" predicate = 1, then shmem_int_and_to_all;
- *               if (all_done) each PE sets its own GLOBAL_DONE = -1.
- * - We reset symmetric state between iterations and put barriers OUTSIDE the timed region.
- * - Reported times are from PE 0 (typical microbench convention).
  */
+
+ #define _POSIX_C_SOURCE 199309L
 
  #include <shmem.h>
  #include <stdio.h>
@@ -96,7 +95,6 @@
      *td->GLOBAL_DONE = 0;
      for (int i = 0; i < td->fanout; ++i) td->child_vals[i] = 0;
  
-     /* pSync must be initialized to SHMEM_SYNC_VALUE before first collective */
      for (int i = 0; i < SHMEM_REDUCE_SYNC_SIZE; ++i) td->pSync_red[i] = SHMEM_SYNC_VALUE;
  
      shmem_barrier_all();
@@ -115,10 +113,11 @@
      shmem_barrier_all();
  }
  
- /* Reset per-round state (done outside timed region) */
+ /* Reset per-round state (done outside timed region; barriers protect reuse) */
  static void reset_for_tree_round(tree_done_t *td) {
      *td->LOCAL_DONE = 0;
      *td->GLOBAL_DONE = 0;
+     /* Only the first num_children slots are used; clear all for simplicity */
      for (int i = 0; i < td->fanout; ++i) td->child_vals[i] = 0;
  }
  
@@ -130,49 +129,52 @@
      for (int i = 0; i < SHMEM_REDUCE_SYNC_SIZE; ++i) td->pSync_red[i] = SHMEM_SYNC_VALUE;
  }
  
- /* -------------------- algorithm: TreeReduce termination -------------------- */
+ /* -------------------- TreeReduce termination (no atomics) -------------------- */
  
  static void treedone_collective_tree(tree_done_t *td) {
      *td->LOCAL_DONE = -1;
  
-     /* Parents wait for all children to write 1 to our child_vals slots */
-     if (td->num_children > 0) {
-         const int need = td->num_children;
-         while (1) {
-             int seen = 0;
-             for (int i = 0; i < need; ++i) {
-                 if (td->child_vals[i] == 1) ++seen;
-             }
-             if (seen == need) break;
-             shmem_fence(); /* polite spin */
-         }
+     /* Upward phase: wait for all children to set our slots to 1 */
+     for (int i = 0; i < td->num_children; ++i) {
+         shmem_int_wait_until(&td->child_vals[i], SHMEM_CMP_EQ, 1);
      }
  
      if (td->me != 0) {
-         /* Inform parent our whole subtree is done */
+         /* Inform parent our subtree is done */
          const int p = td->parent;
          const int slot = slot_index(td->me, p, td->fanout);
          assert(slot >= 0 && slot < td->fanout);
          shmem_int_p(&td->child_vals[slot], 1, p);
          shmem_fence();
-     } else {
-         /* Root: set GLOBAL_DONE on all PEs (simple broadcast) */
-         *td->GLOBAL_DONE = -1;
-         shmem_quiet();
-         for (int pe = 0; pe < td->np; ++pe) {
-             if (pe == td->me) continue;
-             shmem_int_p(td->GLOBAL_DONE, -1, pe);
+ 
+         /* Wait for parent's broadcast */
+         shmem_int_wait_until(td->GLOBAL_DONE, SHMEM_CMP_EQ, -1);
+ 
+         /* Forward broadcast to children */
+         for (int i = 0; i < td->num_children; ++i) {
+             int child = td->first_child + i;
+             shmem_int_p(td->GLOBAL_DONE, -1, child);
          }
          shmem_quiet();
+     } else {
+         /* Root: start broadcast */
+         *td->GLOBAL_DONE = -1;   /* self */
+         shmem_quiet();
+         for (int i = 0; i < td->num_children; ++i) {
+             int child = td->first_child + i;
+             shmem_int_p(td->GLOBAL_DONE, -1, child);
+         }
+         shmem_quiet();
+         /* Children will cascade */
      }
  
-     while (*td->GLOBAL_DONE != -1) shmem_fence();
+     /* Ensure caller returns only after local view sees the flag (cheap if already -1) */
+     shmem_int_wait_until(td->GLOBAL_DONE, SHMEM_CMP_EQ, -1);
  }
  
- /* -------------------- algorithm: Allreduce termination -------------------- */
+ /* -------------------- Allreduce termination -------------------- */
  
  static void treedone_collective_allreduce(tree_done_t *td) {
-     /* Everyone declares "locally done" then does an AND reduction */
      *td->LOCAL_DONE = -1;
      *td->and_src = 1;  /* predicate: I am done */
  
@@ -189,11 +191,10 @@
      );
  
      if (*td->and_dst == 1) {
-         /* All PEs are done: set local terminate flag */
-         *td->GLOBAL_DONE = -1;
+         *td->GLOBAL_DONE = -1;  /* each PE knows it's globally done */
      }
  
-     while (*td->GLOBAL_DONE != -1) shmem_fence();
+     shmem_int_wait_until(td->GLOBAL_DONE, SHMEM_CMP_EQ, -1);
  }
  
  /* -------------------- harness -------------------- */
@@ -264,7 +265,6 @@
          shmem_barrier_all();
          treedone_collective_allreduce(&td);
          shmem_barrier_all();
-         /* pSync must be reset before next collective */
          for (int i = 0; i < SHMEM_REDUCE_SYNC_SIZE; ++i) td.pSync_red[i] = SHMEM_SYNC_VALUE;
      }
  
