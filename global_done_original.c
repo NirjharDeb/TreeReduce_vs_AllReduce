@@ -1,7 +1,14 @@
-/* compile (examples):
+/* global_done_original.c
+ *
+ * Minimal standalone OpenSHMEM program implementing initiate_global_done().
+ * 
+ * By default, you can run this with 24 PEs per node (e.g. with --ntasks-per-node=24).
+ *
+ * Compile:
  *   oshcc -O3 -std=c11 -o global_done_original global_done_original.c
- * run:
- *   oshrun -n 4 ./global_done_original
+ *
+ * Run (example with 48 PEs, 24 per node on 2 nodes):
+ *   oshrun -N 2 --ntasks-per-node=24 ./global_done_original
  */
 
  #include <shmem.h>
@@ -14,11 +21,9 @@
  static void global_done(void) {
      int me = shmem_my_pe();
      /* Optional: print which PE triggered termination */
-     if (me == 0) {
-         /* Keep output minimal to avoid interleaving noise */
-         printf("global_done() invoked by PE %d\n", me);
-         fflush(stdout);
-     }
+     printf("global_done() invoked by PE %d\n", me);
+     fflush(stdout);
+ 
      /* Terminate the entire program cleanly for all PEs */
      shmem_global_exit(0);
  }
@@ -56,7 +61,6 @@
      /* Allocate symmetric memory for LOCAL_DONE and initialize to 0 */
      LOCAL_DONE = shmem_malloc(sizeof(int));
      if (!LOCAL_DONE) {
-         /* If allocation fails, try to exit cleanly */
          shmem_global_exit(1);
      }
      *LOCAL_DONE = 0;
