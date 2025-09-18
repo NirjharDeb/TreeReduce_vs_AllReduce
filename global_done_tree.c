@@ -4,7 +4,8 @@
  * - Leaf groups of size G (ENV: GLOBAL_GROUP_SIZE, default 8).
  * - "Last PE in a group" detection flips a done flag at the group's leader PE.
  * - Leaders propagate up a binary tree of groups via parent flags.
- * - Root (PE 0) prints aggregated elapsed times and calls shmem_global_exit(0).
+ * - Root (PE 0) prints aggregated elapsed times and coordinates a two-phase exit
+ *   so that non-roots exit first; root exits last to avoid RMA-after-teardown.
  *
  * Debug:
  *   GLOBAL_DONE_DEBUG=0 (default) -> quiet aggregate only
@@ -36,6 +37,7 @@
  static int    *LOCAL_DONE;      /* -1 = done, 0 = not done */
  static double *ELAPSED_MS;      /* per-PE elapsed time (ms) */
  static int    *AGG_PRINTED;     /* print-once flag at ROOT_PE */
+ static int    *ROOT_GO;         /* on ROOT_PE: 0 = hold, 1 = non-roots may exit */
  
  static int   **GROUP_DONE;      /* per level array of group flags (symmetric) */
  static int     MAX_LEVELS;      /* number of levels including root level */
@@ -116,18 +118,15 @@
      nanosleep(&ts, NULL);
  }
  
- /* ---------- aggregation printing ---------- */
+ /* ---------- root print + coordinated exit ---------- */
  
- static void maybe_print_aggregate_and_exit(void) {
+ static void root_print_then_release_and_exit(void) {
      int npes = shmem_n_pes();
      int me   = shmem_my_pe();
  
-     /* Only one global print in quiet mode; in debug we still do once. */
-     int should_print = 1;
+     /* Print aggregate ONCE (root only). */
      int old = shmem_int_atomic_compare_swap(AGG_PRINTED, 0, 1, ROOT_PE);
-     should_print = (old == 0);
- 
-     if (should_print) {
+     if (old == 0 && me == ROOT_PE) {
          double sum = 0.0, minv = 0.0, maxv = 0.0, val;
          for (int pe = 0; pe < npes; pe++) {
              val = (pe == me) ? *ELAPSED_MS : shmem_double_g(ELAPSED_MS, pe);
@@ -142,13 +141,24 @@
          fflush(stdout);
      }
  
-     if (g_debug) {
-         double elapsed_ms = (now_sec() - g_start_time) * 1e3;
-         printf("PE %d (root) calling shmem_global_exit after %.3f ms\n", me, elapsed_ms);
-         fflush(stdout);
-     }
+     /* Phase B: tell others to exit themselves */
+     if (me == ROOT_PE) {
+         shmem_int_p(ROOT_GO, 1, ROOT_PE);  /* publish GO=1 on root */
+         shmem_quiet();                      /* ensure visibility */
  
-     shmem_global_exit(0);
+         if (g_debug) {
+             double elapsed_ms = (now_sec() - g_start_time) * 1e3;
+             printf("PE %d (root) releasing non-roots; will exit last (t=%.3f ms)\n", me, elapsed_ms);
+             fflush(stdout);
+         }
+ 
+         /* small grace period to let others stop polling us */
+         struct timespec ts = {0, 2 * 1000 * 1000}; /* 2 ms */
+         nanosleep(&ts, NULL);
+ 
+         shmem_quiet();
+         shmem_global_exit(0);
+     }
  }
  
  /* ---------- core algorithm ---------- */
@@ -187,13 +197,33 @@
  
  /* Attempt to propagate done flags up the binary tree.
   * Any PE may help, but only the designated group leaders will "own" and write parent flags.
-  * Root leader (PE 0) will print and exit once top-level flag is set. */
+  * Root leader (PE 0) will coordinate a two-phase exit once top-level flag is set. */
  static void propagate_up_and_maybe_exit(void) {
      int me   = shmem_my_pe();
      int npes = shmem_n_pes();
  
-     /* Keep attempting until global exit happens (root will call it) */
+     /* Keep attempting until global exit happens (root will call it last) */
      while (1) {
+         /* EARLY CHECK: if top flag is set, stop all work immediately */
+         int top_level = MAX_LEVELS - 1;
+         int top_flag  = shmem_int_g(&GROUP_DONE[top_level][0], ROOT_PE);
+ 
+         if (top_flag == 1) {
+             if (me == ROOT_PE) {
+                 /* root prints, then releases others, then exits last */
+                 root_print_then_release_and_exit();
+                 /* not reached */
+             } else {
+                 /* Wait for root to flip GO, then exit ourselves. Avoid other RMAs. */
+                 while (shmem_int_g(ROOT_GO, ROOT_PE) == 0) {
+                     tiny_pause();
+                 }
+                 shmem_quiet();
+                 shmem_global_exit(0);
+                 /* not reached */
+             }
+         }
+ 
          /* 1) First, try to set our leaf group if possible */
          (void) try_mark_leaf_group_done(me, npes);
  
@@ -242,18 +272,6 @@
              }
          }
  
-         /* 3) Check if the root flag is set, then root performs print+exit */
-         {
-             int top_level = MAX_LEVELS - 1;
-             int root_flag = shmem_int_g(&GROUP_DONE[top_level][0], ROOT_PE);
-             if (root_flag == 1) {
-                 if (me == ROOT_PE) {
-                     maybe_print_aggregate_and_exit();
-                 }
-                 /* root will terminate everyone shortly */
-             }
-         }
- 
          tiny_pause();
      }
  }
@@ -276,11 +294,13 @@
      LOCAL_DONE  = shmem_malloc(sizeof(int));
      ELAPSED_MS  = shmem_malloc(sizeof(double));
      AGG_PRINTED = shmem_malloc(sizeof(int));
-     if (!LOCAL_DONE || !ELAPSED_MS || !AGG_PRINTED) shmem_global_exit(1);
+     ROOT_GO     = shmem_malloc(sizeof(int));
+     if (!LOCAL_DONE || !ELAPSED_MS || !AGG_PRINTED || !ROOT_GO) shmem_global_exit(1);
  
      *LOCAL_DONE  = 0;
      *ELAPSED_MS  = 0.0;
      *AGG_PRINTED = 0;
+     *ROOT_GO     = 0;
  
      allocate_tree_flags(npes);
  
@@ -302,7 +322,7 @@
          }
      }
  
-     /* Everyone participates in propagation; only root exits the job */
+     /* Everyone participates in propagation; root coordinates exit last */
      propagate_up_and_maybe_exit();
  
      /* Not reached (root exits the job for all PEs). */
