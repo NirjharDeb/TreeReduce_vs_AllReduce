@@ -5,7 +5,8 @@
  * - "Last PE in a group" detection flips a done flag at the group's leader PE.
  * - Leaders propagate up a binary tree of groups via parent flags.
  * - Root (PE 0) prints aggregated elapsed times and coordinates a two-phase exit
- *   so that non-roots exit first; root exits last to avoid RMA-after-teardown.
+ *   so that non-roots exit first; root exits absolutely last after ACKs to avoid
+ *   RMA-after-teardown (SIGBUS / CMA errors).
  *
  * Debug:
  *   GLOBAL_DONE_DEBUG=0 (default) -> quiet aggregate only
@@ -38,6 +39,7 @@
  static double *ELAPSED_MS;      /* per-PE elapsed time (ms) */
  static int    *AGG_PRINTED;     /* print-once flag at ROOT_PE */
  static int    *ROOT_GO;         /* on ROOT_PE: 0 = hold, 1 = non-roots may exit */
+ static long   *EXIT_ACKS;       /* on ROOT_PE: number of non-roots that acknowledged and will exit */
  
  static int   **GROUP_DONE;      /* per level array of group flags (symmetric) */
  static int     MAX_LEVELS;      /* number of levels including root level */
@@ -118,7 +120,7 @@
      nanosleep(&ts, NULL);
  }
  
- /* ---------- root print + coordinated exit ---------- */
+ /* ---------- root print + coordinated exit (with ACKs) ---------- */
  
  static void root_print_then_release_and_exit(void) {
      int npes = shmem_n_pes();
@@ -141,20 +143,29 @@
          fflush(stdout);
      }
  
-     /* Phase B: tell others to exit themselves */
+     /* Release non-roots to exit, then wait for ACKs from all of them. */
      if (me == ROOT_PE) {
-         shmem_int_p(ROOT_GO, 1, ROOT_PE);  /* publish GO=1 on root */
-         shmem_quiet();                      /* ensure visibility */
+         /* Publish GO = 1 */
+         shmem_int_p(ROOT_GO, 1, ROOT_PE);
+         shmem_quiet();
  
          if (g_debug) {
              double elapsed_ms = (now_sec() - g_start_time) * 1e3;
-             printf("PE %d (root) releasing non-roots; will exit last (t=%.3f ms)\n", me, elapsed_ms);
+             printf("PE %d (root) released non-roots; waiting for %d ACKs (t=%.3f ms)\n",
+                    me, npes - 1, elapsed_ms);
              fflush(stdout);
          }
  
-         /* small grace period to let others stop polling us */
-         struct timespec ts = {0, 2 * 1000 * 1000}; /* 2 ms */
-         nanosleep(&ts, NULL);
+         /* Wait for all non-roots to acknowledge they are exiting */
+         while (shmem_long_g(EXIT_ACKS, ROOT_PE) < (long)(npes - 1)) {
+             tiny_pause();
+         }
+ 
+         if (g_debug) {
+             double elapsed_ms = (now_sec() - g_start_time) * 1e3;
+             printf("PE %d (root) received all ACKs; exiting last (t=%.3f ms)\n", me, elapsed_ms);
+             fflush(stdout);
+         }
  
          shmem_quiet();
          shmem_global_exit(0);
@@ -210,14 +221,15 @@
  
          if (top_flag == 1) {
              if (me == ROOT_PE) {
-                 /* root prints, then releases others, then exits last */
+                 /* root prints, then releases others, waits ACKs, exits last */
                  root_print_then_release_and_exit();
                  /* not reached */
              } else {
-                 /* Wait for root to flip GO, then exit ourselves. Avoid other RMAs. */
+                 /* Wait for root to flip GO, then ACK and exit ourselves. Avoid other RMAs. */
                  while (shmem_int_g(ROOT_GO, ROOT_PE) == 0) {
                      tiny_pause();
                  }
+                 (void) shmem_long_atomic_fetch_inc(EXIT_ACKS, ROOT_PE);
                  shmem_quiet();
                  shmem_global_exit(0);
                  /* not reached */
@@ -295,12 +307,14 @@
      ELAPSED_MS  = shmem_malloc(sizeof(double));
      AGG_PRINTED = shmem_malloc(sizeof(int));
      ROOT_GO     = shmem_malloc(sizeof(int));
-     if (!LOCAL_DONE || !ELAPSED_MS || !AGG_PRINTED || !ROOT_GO) shmem_global_exit(1);
+     EXIT_ACKS   = shmem_malloc(sizeof(long));
+     if (!LOCAL_DONE || !ELAPSED_MS || !AGG_PRINTED || !ROOT_GO || !EXIT_ACKS) shmem_global_exit(1);
  
      *LOCAL_DONE  = 0;
      *ELAPSED_MS  = 0.0;
      *AGG_PRINTED = 0;
      *ROOT_GO     = 0;
+     *EXIT_ACKS   = 0;
  
      allocate_tree_flags(npes);
  
