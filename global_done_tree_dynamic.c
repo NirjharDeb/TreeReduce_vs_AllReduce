@@ -170,10 +170,8 @@
              fflush(stdout);
          }
  
-         /* Wait for all non-roots to acknowledge they are exiting */
-         while (shmem_long_g(EXIT_ACKS, ROOT_PE) < (long)(npes - 1)) {
-             tiny_pause();
-         }
+         /* *** CHANGE: wait efficiently for all ACKs (no spin loop) *** */
+         shmem_long_wait_until(EXIT_ACKS, SHMEM_CMP_GE, (long)(npes - 1));
  
          if (g_debug) {
              double elapsed_ms = (now_sec() - g_start_time) * 1e3;
@@ -241,9 +239,8 @@
                  root_print_then_release_and_exit();
                  /* not reached */
              } else {
-                 while (shmem_int_g(ROOT_GO, ROOT_PE) == 0) {
-                     tiny_pause();
-                 }
+                 /* *** CHANGE: wait efficiently on ROOT_GO instead of spinning *** */
+                 shmem_int_wait_until(ROOT_GO, SHMEM_CMP_NE, 0);
                  (void) shmem_long_atomic_fetch_inc(EXIT_ACKS, ROOT_PE);
                  shmem_quiet();
                  shmem_global_exit(0);
