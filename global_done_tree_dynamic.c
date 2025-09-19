@@ -1,22 +1,12 @@
 /* global_done_tree_dynamic.c
  *
  * Tree-based global termination for OpenSHMEM with DYNAMIC leaders.
- * - The "leader" of each group (at every level) is chosen dynamically as the PE
- *   that *successfully completes that group's done CAS*:
- *     - At LEAF level, this is the PE that increments the group's completion
- *       counter to the group size (i.e., the last finisher in the leaf).
- *     - At INTERNAL levels, this is the PE that first observes both children
- *       done and successfully CASes the group's flag from 0->1.
- * - Group flags are still *hosted* at the canonical static group owner
- *   (first PE of the group's span) to keep addressing simple, but the PE
- *   that *acts as leader* is dynamic and stored in GROUP_LEADER[L][g].
- * - Root (PE 0) still coordinates two-phase exit/printing.
- *
- * Compile:
- *   oshcc -O3 -std=c11 -o global_done_tree_dynamic global_done_tree_dynamic.c
- *
- * Run:
- *   srun --mpi=pmix -N 1 -n 24 ./global_done_tree_dynamic
+ * - The "leader" of each group (at every level) is the last to finish within that group:
+ *     - At LEAF level, detected by fetch_inc reaching (group_size-1).
+ *     - At INTERNAL levels, detected by the second (or only) child to finish.
+ * - Group flags are *hosted* at the canonical static group owner for addressing,
+ *   but the acting leader is dynamic and stored in GROUP_LEADER[L][g].
+ * - Root (PE 0) coordinates the final two-phase exit/printing.
  */
 
  #define _POSIX_C_SOURCE 199309L
@@ -48,6 +38,9 @@
  
  /* Leaf-level completion counters (hosted at static leaf owner PE) */
  static int    *LEAF_COUNT;
+ 
+ /* NEW: per-parent child completion counters (levels 1..MAX_LEVELS-1) */
+ static int   **CHILD_DONE_COUNT;
  
  static int     G_LEAF = 8;      /* leaf group size (can be changed via env) */
  static int     g_debug = 0;
@@ -126,6 +119,17 @@
      LEAF_COUNT = shmem_malloc(sizeof(int) * NUM_GROUPS[0]);
      if (!LEAF_COUNT) shmem_global_exit(1);
      for (int i = 0; i < NUM_GROUPS[0]; i++) LEAF_COUNT[i] = 0;
+ 
+     /* NEW: child completion counters for parents at levels 1..MAX_LEVELS-1 */
+     CHILD_DONE_COUNT = shmem_malloc(sizeof(int*) * MAX_LEVELS);
+     if (!CHILD_DONE_COUNT) shmem_global_exit(1);
+     CHILD_DONE_COUNT[0] = NULL; /* unused for leaves */
+     for (int L = 1; L < MAX_LEVELS; L++) {
+         int ng = NUM_GROUPS[L];
+         CHILD_DONE_COUNT[L] = shmem_malloc(sizeof(int) * ng);
+         if (!CHILD_DONE_COUNT[L]) shmem_global_exit(1);
+         for (int i = 0; i < ng; i++) CHILD_DONE_COUNT[L][i] = 0;
+     }
  }
  
  /* Spin helper: small backoff to avoid hammering */
@@ -184,12 +188,62 @@
      }
  }
  
+ /* -------- NEW: complete a group and (if last child) propagate upward -------- */
+ static void complete_group_and_maybe_propagate(int me, int L, int gidx, int npes) {
+     /* Set this group's done flag and leader (hosted at its static owner) */
+     int host = static_group_owner_pe(G_LEAF, L, gidx);
+     (void) shmem_int_atomic_compare_swap(&GROUP_DONE[L][gidx], 0, 1, host);
+     shmem_int_p(&GROUP_LEADER[L][gidx], me, host);
+ 
+     if (g_debug) {
+         printf("PE %d finalized L=%d,g=%d (host=%d) as dynamic leader\n", me, L, gidx, host);
+         fflush(stdout);
+     }
+ 
+     /* Walk up while we are the LAST finishing child at each parent */
+     while (L + 1 < MAX_LEVELS) {
+         int parent_L   = L + 1;
+         int parent_idx = gidx / 2;
+         int parent_host = static_group_owner_pe(G_LEAF, parent_L, parent_idx);
+ 
+         /* Determine how many children this parent has (1 for tail, else 2) */
+         int childL = left_child_idx(parent_idx);
+         int childR = right_child_idx(parent_idx);
+         int expected_children = 1 + (childR < NUM_GROUPS[L] ? 1 : 0);
+ 
+         /* Atomically record that this child finished */
+         int prior = shmem_int_atomic_fetch_inc(&CHILD_DONE_COUNT[parent_L][parent_idx], parent_host);
+ 
+         if (prior + 1 == expected_children) {
+             /* We are the LAST child to finish => we become parent's dynamic leader */
+             (void) shmem_int_atomic_compare_swap(&GROUP_DONE[parent_L][parent_idx], 0, 1, parent_host);
+             shmem_int_p(&GROUP_LEADER[parent_L][parent_idx], me, parent_host);
+ 
+             if (g_debug) {
+                 printf("PE %d became DYNAMIC leader at L=%d,g=%d (last child; host=%d)\n",
+                        me, parent_L, parent_idx, parent_host);
+                 fflush(stdout);
+             }
+ 
+             /* Move up a level and repeat */
+             L    = parent_L;
+             gidx = parent_idx;
+             host = parent_host;
+             continue;
+         } else {
+             /* Not the last child at this parent; stop propagating here */
+             break;
+         }
+     }
+ }
+ 
  /* ---------- core algorithm ---------- */
  
  /* Try to mark the leaf group as done using a *dynamic* leader:
   * Each PE increments the group's leaf counter at the group's static owner PE.
   * The PE that observes its fetch_inc return == (group_size - 1) is the last finisher,
-  * becomes the dynamic leader for this leaf group, and sets the leaf GROUP_DONE flag. */
+  * becomes the dynamic leader for this leaf group, completes the group, and
+  * (if last child at parent) propagates upward via CHILD_DONE_COUNT. */
  static int try_mark_leaf_group_done(int me, int npes) {
      const int level = 0;
      const int span  = group_span_at_level(G_LEAF, level);
@@ -209,22 +263,17 @@
      int prior = shmem_int_atomic_fetch_inc(&LEAF_COUNT[gidx], host);
  
      if (prior == gsize - 1) {
-         /* I'm the last finisher in this leaf group -> dynamic leader */
-         (void) shmem_int_atomic_compare_swap(&GROUP_DONE[level][gidx], 0, 1, host);
-         shmem_int_p(&GROUP_LEADER[level][gidx], me, host);
-         if (g_debug) {
-             printf("PE %d is DYNAMIC LEAF LEADER for group %d (size=%d); flag set at host %d\n",
-                    me, gidx, gsize, host);
-             fflush(stdout);
-         }
+         /* I'm the last finisher in this leaf group -> I complete it and maybe propagate */
+         complete_group_and_maybe_propagate(me, /*L=*/0, gidx, npes);
          return 1;
      }
      return 0;
  }
  
  /* Attempt to propagate done flags up the binary tree.
-  * Allow seeding of a leader when none exists; otherwise only the dynamic leader acts.
-  * Group flags/leaders are hosted at the group's static owner PE to keep addressing stable. */
+  * INTERNAL groups are now completed exclusively by the LAST child to finish
+  * (via complete_group_and_maybe_propagate), so we no longer do "anyone can CAS"
+  * based on reading both children done. */
  static void propagate_up_and_maybe_exit(void) {
      int me   = shmem_my_pe();
      int npes = shmem_n_pes();
@@ -250,66 +299,10 @@
              }
          }
  
-         /* 1) Try to complete our leaf group (this will elect the dynamic leader). */
+         /* Leaves elect leaders and trigger upward propagation when last in their group */
          (void) try_mark_leaf_group_done(me, npes);
  
-         /* 2) Internal levels: allow seeding when no leader yet; otherwise only the
-          *    dynamic leader acts. */
-         for (int L = 1; L < MAX_LEVELS; L++) {
-             int span_here   = group_span_at_level(G_LEAF, L);
-             int my_gidx     = me / span_here;
-             int static_host = static_group_owner_pe(G_LEAF, L, my_gidx);
- 
-             /* If a leader exists and it's not me, skip. If no leader yet (-1), I may try to seed. */
-             int cur_leader = shmem_int_g(&GROUP_LEADER[L][my_gidx], static_host);
-             if (cur_leader != -1 && cur_leader != me) continue;
- 
-             /* Check children done (read from their static hosts). */
-             int childL = left_child_idx(my_gidx);
-             int childR = right_child_idx(my_gidx);
-             if (childL >= NUM_GROUPS[L-1]) continue;
- 
-             int left_host = static_group_owner_pe(G_LEAF, L-1, childL);
-             int left_done = shmem_int_g(&GROUP_DONE[L-1][childL], left_host);
- 
-             int right_done = 1;
-             if (childR < NUM_GROUPS[L-1]) {
-                 int right_host = static_group_owner_pe(G_LEAF, L-1, childR);
-                 right_done = shmem_int_g(&GROUP_DONE[L-1][childR], right_host);
-             }
- 
-             if (left_done && right_done) {
-                 /* Try to complete this group; whoever wins CAS becomes dynamic leader. */
-                 int old = shmem_int_atomic_compare_swap(&GROUP_DONE[L][my_gidx], 0, 1, static_host);
-                 if (old == 0) {
-                     /* I just completed this group: seed/overwrite the leader with me. */
-                     shmem_int_p(&GROUP_LEADER[L][my_gidx], me, static_host);
-                     if (g_debug) {
-                         printf("PE %d became DYNAMIC leader at L=%d,g=%d (host=%d)\n",
-                                me, L, my_gidx, static_host);
-                         fflush(stdout);
-                     }
- 
-                     /* If not at the root, opportunistically try to mark parent and seed its leader. */
-                     if (L + 1 < MAX_LEVELS) {
-                         int parent_idx  = my_gidx / 2;
-                         int parent_host = static_group_owner_pe(G_LEAF, L+1, parent_idx);
-                         int pold = shmem_int_atomic_compare_swap(&GROUP_DONE[L+1][parent_idx], 0, 1, parent_host);
-                         if (pold == 0) {
-                             shmem_int_p(&GROUP_LEADER[L+1][parent_idx], me, parent_host);
-                             if (g_debug) {
-                                 printf("PE %d set PARENT L=%d,g=%d done and became its DYNAMIC leader (host=%d)\n",
-                                        me, L+1, parent_idx, parent_host);
-                                 fflush(stdout);
-                             }
-                         }
-                     }
-                 } else {
-                     /* Someone else completed it. If leader still unset, they'll set it soon. */
-                 }
-             }
-         }
- 
+         /* No internal "helping" CAS here—internal completion is driven by last-child promotion. */
          tiny_pause();
      }
  }
