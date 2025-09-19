@@ -41,12 +41,12 @@
  static int    *ROOT_GO;         /* on ROOT_PE: 0 = hold, 1 = non-roots may exit */
  static long   *EXIT_ACKS;       /* on ROOT_PE: number of non-roots that acknowledged and will exit */
  
- static int   **GROUP_DONE;      /* per level array of group flags (hosted at static leader PE) */
- static int   **GROUP_LEADER;    /* per level, dynamic leader PE id (hosted at static leader PE) */
+ static int   **GROUP_DONE;      /* per level array of group flags (hosted at static group owner) */
+ static int   **GROUP_LEADER;    /* per level, dynamic leader PE id (hosted at static group owner) */
  static int     MAX_LEVELS;      /* number of levels including root level */
  static int    *NUM_GROUPS;      /* number of groups at each level */
  
- /* Leaf-level completion counters (hosted at static leaf leader PE) */
+ /* Leaf-level completion counters (hosted at static leaf owner PE) */
  static int    *LEAF_COUNT;
  
  static int     G_LEAF = 8;      /* leaf group size (can be changed via env) */
@@ -225,7 +225,7 @@
  }
  
  /* Attempt to propagate done flags up the binary tree.
-  * Only the *dynamic* leader recorded for a group at level L may act on behalf of that group.
+  * Allow seeding of a leader when none exists; otherwise only the dynamic leader acts.
   * Group flags/leaders are hosted at the group's static owner PE to keep addressing stable. */
  static void propagate_up_and_maybe_exit(void) {
      int me   = shmem_my_pe();
@@ -254,67 +254,62 @@
          /* 1) Try to complete our leaf group (this will elect the dynamic leader). */
          (void) try_mark_leaf_group_done(me, npes);
  
-         /* 2) Internal levels: only the dynamic leader of my (L, my_gidx) may act. */
+         /* 2) Internal levels: allow seeding when no leader yet; otherwise only the
+          *    dynamic leader acts. */
          for (int L = 1; L < MAX_LEVELS; L++) {
              int span_here   = group_span_at_level(G_LEAF, L);
              int my_gidx     = me / span_here;
              int static_host = static_group_owner_pe(G_LEAF, L, my_gidx);
  
-             /* Read current dynamic leader recorded for this group (from static host). */
-             int dyn_leader = shmem_int_g(&GROUP_LEADER[L][my_gidx], static_host);
-             if (dyn_leader != me) continue; /* I'm not the elected dynamic leader at this level. */
+             /* If a leader exists and it's not me, skip. If no leader yet (-1), I may try to seed. */
+             int cur_leader = shmem_int_g(&GROUP_LEADER[L][my_gidx], static_host);
+             if (cur_leader != -1 && cur_leader != me) continue;
  
-             /* Check children done (children hosted at their static owners). */
-             int childL    = left_child_idx(my_gidx);
-             int childR    = right_child_idx(my_gidx);
+             /* Check children done (read from their static hosts). */
+             int childL = left_child_idx(my_gidx);
+             int childR = right_child_idx(my_gidx);
              if (childL >= NUM_GROUPS[L-1]) continue;
  
-             int left_host  = static_group_owner_pe(G_LEAF, L-1, childL);
-             int left_done  = shmem_int_g(&GROUP_DONE[L-1][childL], left_host);
+             int left_host = static_group_owner_pe(G_LEAF, L-1, childL);
+             int left_done = shmem_int_g(&GROUP_DONE[L-1][childL], left_host);
  
              int right_done = 1;
-             int right_host = -1;
              if (childR < NUM_GROUPS[L-1]) {
-                 right_host = static_group_owner_pe(G_LEAF, L-1, childR);
+                 int right_host = static_group_owner_pe(G_LEAF, L-1, childR);
                  right_done = shmem_int_g(&GROUP_DONE[L-1][childR], right_host);
              }
  
              if (left_done && right_done) {
-                 /* Mark my (L,my_gidx) group as done (hosted at static_host). */
-                 int old_me_flag = shmem_int_atomic_compare_swap(&GROUP_DONE[L][my_gidx], 0, 1, static_host);
-                 if (old_me_flag == 0) {
-                     /* Record that *I* am the dynamic leader for this level/group. */
+                 /* Try to complete this group; whoever wins CAS becomes dynamic leader. */
+                 int old = shmem_int_atomic_compare_swap(&GROUP_DONE[L][my_gidx], 0, 1, static_host);
+                 if (old == 0) {
+                     /* I just completed this group: seed/overwrite the leader with me. */
                      shmem_int_p(&GROUP_LEADER[L][my_gidx], me, static_host);
                      if (g_debug) {
                          printf("PE %d became DYNAMIC leader at L=%d,g=%d (host=%d)\n",
                                 me, L, my_gidx, static_host);
                          fflush(stdout);
                      }
-                 }
  
-                 /* If not root level yet, try to set the PARENT group's done flag and
-                  * install myself as the parent's dynamic leader. Both are hosted at
-                  * the parent's static owner PE. */
-                 if (L + 1 < MAX_LEVELS) {
-                     int parent_idx     = my_gidx / 2;
-                     int parent_host    = static_group_owner_pe(G_LEAF, L+1, parent_idx);
-                     int old_parent     = shmem_int_atomic_compare_swap(&GROUP_DONE[L+1][parent_idx], 0, 1, parent_host);
-                     if (old_parent == 0) {
-                         shmem_int_p(&GROUP_LEADER[L+1][parent_idx], me, parent_host);
-                         if (g_debug) {
-                             printf("PE %d set PARENT L=%d,g=%d done and became its DYNAMIC leader (host=%d)\n",
-                                    me, L+1, parent_idx, parent_host);
-                             fflush(stdout);
+                     /* If not at the root, opportunistically try to mark parent and seed its leader. */
+                     if (L + 1 < MAX_LEVELS) {
+                         int parent_idx  = my_gidx / 2;
+                         int parent_host = static_group_owner_pe(G_LEAF, L+1, parent_idx);
+                         int pold = shmem_int_atomic_compare_swap(&GROUP_DONE[L+1][parent_idx], 0, 1, parent_host);
+                         if (pold == 0) {
+                             shmem_int_p(&GROUP_LEADER[L+1][parent_idx], me, parent_host);
+                             if (g_debug) {
+                                 printf("PE %d set PARENT L=%d,g=%d done and became its DYNAMIC leader (host=%d)\n",
+                                        me, L+1, parent_idx, parent_host);
+                                 fflush(stdout);
+                             }
                          }
                      }
+                 } else {
+                     /* Someone else completed it. If leader still unset, they'll set it soon. */
                  }
              }
          }
- 
-         /* 3) For groups where the dynamic leader hasn't been elected yet (non-leaf),
-          *    we need an initial seed so someone can act. A simple rule:
-          *    When GROUP_DONE[L][g] transitions 0->1 (by *any* helper), that helper
-          *    writes GROUP_LEADER[L][g]=me. The case above already does this for dyn leaders. */
  
          tiny_pause();
      }
