@@ -170,7 +170,7 @@
              fflush(stdout);
          }
  
-         /* *** CHANGE: wait efficiently for all ACKs (no spin loop) *** */
+         /* Efficient local wait on the root's EXIT_ACKS */
          shmem_long_wait_until(EXIT_ACKS, SHMEM_CMP_GE, (long)(npes - 1));
  
          if (g_debug) {
@@ -239,8 +239,10 @@
                  root_print_then_release_and_exit();
                  /* not reached */
              } else {
-                 /* *** CHANGE: wait efficiently on ROOT_GO instead of spinning *** */
-                 shmem_int_wait_until(ROOT_GO, SHMEM_CMP_NE, 0);
+                 /* Poll the ROOT_PE's ROOT_GO remotely; wait_until on local would hang */
+                 while (shmem_int_g(ROOT_GO, ROOT_PE) == 0) {
+                     tiny_pause();
+                 }
                  (void) shmem_long_atomic_fetch_inc(EXIT_ACKS, ROOT_PE);
                  shmem_quiet();
                  shmem_global_exit(0);
