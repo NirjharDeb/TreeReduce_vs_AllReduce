@@ -162,8 +162,17 @@
          shmem_quiet();
      }
  
-     /* 4) Everyone waits for the global gate and exits */
+     /* 4) Everyone waits for the global gate; then prove *everyone* saw it and is exiting */
      shmem_int_wait_until(GLOBAL_TERMINATION_READY, SHMEM_CMP_EQ, -1);
+ 
+     /* Ensure all PEs have passed the global gate */
+     shmem_barrier_all();  /* If this completes, every PE observed termination. */
+ 
+     /* One unambiguous final line from root */
+     if (me == ROOT_PE) {
+         printf("ALL_CLEAR: all %d PEs observed termination and reached the final barrier.\n", npes);
+         fflush(stdout);
+     }
  }
  
  /* ---------- main ---------- */
