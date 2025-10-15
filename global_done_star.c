@@ -6,9 +6,9 @@
  * 1) Each PE writes -1 to its *group-local slot* at the group's anchor PE.
  * 2) Each group anchor waits until all members are -1, then marks that group
  *    as done at the root anchor (PE 0).
- * 3) The root waits until all groups are done, sets a single global flag to -1,
- *    and (optionally) prints aggregated timing.
- * 4) Everyone waits on the global flag and exits cleanly.
+ * 3) The root waits until all groups are done, broadcasts a single global flag (-1)
+ *    to every PE, and (optionally) prints aggregated timing.
+ * 4) Everyone waits on the global flag, hits a final barrier, and exits cleanly.
  */
 
  #define _POSIX_C_SOURCE 199309L
@@ -44,8 +44,8 @@
  /* Root’s record that each group has finished: ROOT_GROUP_DONE[g] == -1 means group g is done. */
  static int    *ROOT_GROUP_DONE;            /* length: NUM_GROUPS0, authoritative at ROOT_PE */
  
- /* Global termination gate: set to -1 by the root when global completion is proven. */
- static int    *GLOBAL_TERMINATION_READY;   /* authoritative at ROOT_PE */
+ /* Global termination gate: set/broadcast to -1 by the root when global completion is proven. */
+ static int    *GLOBAL_TERMINATION_READY;   /* each PE waits on its local copy */
  
  /* ---------- helpers ---------- */
  
@@ -138,7 +138,7 @@
          }
      }
  
-     /* 3) Root waits for all groups, then opens the global termination gate */
+     /* 3) Root waits for all groups, then broadcasts the global termination gate */
      if (me == ROOT_PE) {
          for (int g = 0; g < NUM_GROUPS0; g++) {
              shmem_int_wait_until(&ROOT_GROUP_DONE[g], SHMEM_CMP_EQ, -1);
@@ -158,17 +158,23 @@
                 npes, minv, avg, maxv);
          fflush(stdout);
  
-         *GLOBAL_TERMINATION_READY = -1; /* local store at root */
-         shmem_quiet();
+         /* IMPORTANT: broadcast to every PE's local flag so their waits complete */
+         for (int pe = 0; pe < npes; pe++) {
+             if (pe == ROOT_PE) {
+                 *GLOBAL_TERMINATION_READY = -1;                 /* local store for root */
+             } else {
+                 shmem_int_p(GLOBAL_TERMINATION_READY, -1, pe);  /* remote PUT to each PE */
+             }
+         }
+         shmem_quiet();  /* ensure all PUTs are visible */
      }
  
      /* 4) Everyone waits for the global gate; then prove *everyone* saw it and is exiting */
      shmem_int_wait_until(GLOBAL_TERMINATION_READY, SHMEM_CMP_EQ, -1);
  
-     /* Ensure all PEs have passed the global gate */
-     shmem_barrier_all();  /* If this completes, every PE observed termination. */
+     /* Final collective proof: if this completes, every PE observed the gate */
+     shmem_barrier_all();
  
-     /* One unambiguous final line from root */
      if (me == ROOT_PE) {
          printf("ALL_CLEAR: all %d PEs observed termination and reached the final barrier.\n", npes);
          fflush(stdout);
