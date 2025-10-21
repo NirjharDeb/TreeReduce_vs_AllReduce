@@ -114,6 +114,10 @@
      const int owner = static_group_owner_pe(G_LEAF, /*level=*/0, gidx);
  
      /* 1) Each PE marks its own slot at the group owner to -1 and flushes */
+     /* Record local completion time like initiate_global_done() */
+     *LOCAL_DONE = -1;
+     *ELAPSED_MS = (now_sec() - g_start_time) * 1e3;
+ 
      shmem_int_p(&GROUP_PE_DONE[gidx][idx], -1, owner);
      shmem_quiet();
  
@@ -144,7 +148,7 @@
              shmem_int_wait_until(&ROOT_GROUP_DONE[g], SHMEM_CMP_EQ, -1);
          }
  
-         /* Optional: print simple timing summary */
+         /* Optional: print simple timing summary (per-PE times when they set LOCAL_DONE) */
          double sum = 0.0, minv = 0.0, maxv = 0.0;
          for (int pe = 0; pe < npes; pe++) {
              double val = (pe == me) ? *ELAPSED_MS : shmem_double_g(ELAPSED_MS, pe);
@@ -204,10 +208,6 @@
      *ELAPSED_MS = 0.0;
  
      allocate_star_flags(npes);
- 
-     /* Mark local done and timestamp (placeholder for user work) */
-     *LOCAL_DONE = -1;
-     *ELAPSED_MS = (now_sec() - g_start_time) * 1e3;
  
      if (g_debug && me == 0) {
          printf("[DEBUG] npes=%d, group_size=%d, num_groups=%d\n",
