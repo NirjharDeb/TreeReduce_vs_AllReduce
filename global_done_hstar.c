@@ -1,13 +1,19 @@
 /* global_done_hstar.c
  *
- * H-STAR (multi-level STAR) global termination for OpenSHMEM (no atomics).
+ * H-STAR (multi-level STAR) global termination for OpenSHMEM — no atomics.
  *
- * Model (0 = not done, -1 = done):
- * 1) Each PE writes -1 to its *group-local slot* at the level-0 group's anchor.
- * 2) Each level-0 anchor waits for its members, then marks its parent group's slot at level 1.
- * 3) This repeats up the levels until the top-level root proves global completion.
- * 4) The root initiates a tree broadcast of a single global flag (-1) downward.
- * 5) Everyone waits on the per-PE global flag, hits a final barrier, and exits cleanly.
+ * High-level steps (matches original semantics: one aggregate print, then exit):
+ *   1) Each PE marks itself done and records ELAPSED_MS.
+ *   2) Leaf fan-in: PEs are partitioned in groups of G_LEAF; each PUTs -1 to its
+ *      slot at the group owner (first PE of the span). Owner waits for all members.
+ *   3) Hierarchical fan-in: group owners form a K-ary tree. A level-l owner, after
+ *      seeing all its children, PUTs -1 into its parent’s slot at level l+1.
+ *   4) Root detection: the single top-level owner (PE 0) is proven done, gathers
+ *      all ELAPSED_MS (shmem_double_g), prints min/avg/max, then shmem_global_exit(0).
+ *
+ * Env:
+ *   GLOBAL_GROUP_SIZE -> G_LEAF (default 8), GLOBAL_BRANCH_K -> K (default 8, >=2),
+ *   GLOBAL_DONE_DEBUG -> per-run debug toggle (0/1).
  */
 
  #define _POSIX_C_SOURCE 199309L
@@ -29,9 +35,9 @@
  static int    *LOCAL_DONE;                 /* per-PE local flag: -1 = done, 0 = not done */
  static double *ELAPSED_MS;                 /* per-PE elapsed time (ms) */
  
- /* STAR scheme configuration/state */
- static int     G_LEAF = 8;                 /* group size (can be changed via env) */
- static int     NUM_GROUPS0 = 0;            /* number of groups at "leaf" granularity */
+ /* STAR/H-STAR scheme configuration/state */
+ static int     G_LEAF = 8;                 /* leaf group size (env: GLOBAL_GROUP_SIZE) */
+ static int     NUM_GROUPS0 = 0;            /* number of groups at leaf granularity */
  static int     g_debug = 0;
  static double  g_start_time = 0.0;
  static const int ROOT_PE = 0;
@@ -40,31 +46,23 @@
   * GROUP_PE_DONE[g][member] == -1 means that member PE has finished. */
  static int   **GROUP_PE_DONE;              /* shape: [NUM_GROUPS0][G_LEAF] */
  
- /* Root’s record that each group has finished: ROOT_GROUP_DONE[g] == -1 means group g is done.
-  * (Retained for backward compatibility; not used by H-STAR.) */
- static int    *ROOT_GROUP_DONE;            /* length: NUM_GROUPS0, authoritative at ROOT_PE */
+ /* Retained for compatibility (not used in the critical path). */
+ static int    *ROOT_GROUP_DONE;            /* length: NUM_GROUPS0 */
  
- /* Global termination gate: set/broadcast to -1 by the root (hierarchically in H-STAR). */
- static int    *GLOBAL_TERMINATION_READY;   /* each PE waits on its local copy */
+ /* ---------- H-STAR additions ---------- */
  
- /* ---------- H-STAR additions (minimal) ---------- */
- 
- /* H-STAR: branching factor above the leaf (children per owner at levels >= 1) */
+ /* Branching factor above the leaf (children per owner at levels >= 1) */
  static int K = 8;
  
- /* H-STAR: total number of levels (level 0 = leaf; level LEVELS-1 = root) */
+ /* Total number of levels (level 0 = leaf; level LEVELS-1 = root) */
  static int LEVELS = 1;
  
- /* H-STAR: per-level group counts; NUM_GROUPS[0] == NUM_GROUPS0 */
+ /* Per-level group counts; NUM_GROUPS[0] == NUM_GROUPS0 */
  static int *NUM_GROUPS;                    /* length LEVELS */
  
- /* H-STAR: child completion mailboxes per level.
+ /* Child completion mailboxes per level.
   * For l=0 this *aliases* GROUP_PE_DONE to stay close to original layout/style. */
  static int ***LVL_CHILD_DONE;              /* [LEVELS][NUM_GROUPS[l]][child_cap(l)] */
- 
- /* H-STAR: per-(level,group) downward broadcast token.
-  * Owners wait on their local token, then forward to children (owners or PEs). */
- static int  **LVL_BCAST_TOKEN;             /* [LEVELS][NUM_GROUPS[l]] */
  
  /* ---------- helpers ---------- */
  
@@ -82,7 +80,7 @@
      return (v >= 1) ? v : 8;
  }
  
- /* H-STAR: read branch factor K from env */
+ /* read branch factor K from env */
  static int env_branch_k(void) {
      const char *e = getenv("GLOBAL_BRANCH_K");
      if (!e || e[0] == '\0') return 8;
@@ -92,7 +90,7 @@
  
  static inline int ceil_div(int a, int b) { return (a + b - 1) / b; }
  
- /* H-STAR: integer power for spans (K^level) */
+ /* integer power for spans (K^level) */
  static inline int ipow(int base, int exp) {
      int r = 1;
      while (exp-- > 0) r *= base;
@@ -100,20 +98,18 @@
  }
  
  /* size (in PEs) of a group at level L (L=0 is leaf) */
- /* H-STAR: was leaf_size * 2^level; generalize to leaf_size * K^level */
  static inline int group_span_at_level(int leaf_size, int level) {
      return leaf_size * ipow(K, level);
  }
  
  /* canonical (static) group owner PE id for (level, group_idx) */
- /* H-STAR: use the proper level span (kept signature/style) */
  static inline int static_group_owner_pe(int leaf_size, int level, int group_idx) {
      return group_idx * group_span_at_level(leaf_size, level);
  }
  
  /* ---------- H-STAR planning/allocation ---------- */
  
- /* H-STAR: compute number of levels and groups per level */
+ /* compute number of levels and groups per level */
  static void compute_levels_and_groups(int npes) {
      int ng0 = ceil_div(npes, G_LEAF);
      /* Count levels until exactly one group remains at the top. */
@@ -134,7 +130,7 @@
  
  /* ---------- STAR/H-STAR allocation ---------- */
  static void allocate_star_flags(int npes) {
-     /* H-STAR: compute hierarchy first (kept function name to minimize churn) */
+     /* Build the hierarchy first */
      compute_levels_and_groups(npes);
  
      /* Level-0 per-group per-member flags at group anchors (as before). */
@@ -146,20 +142,14 @@
          for (int i = 0; i < G_LEAF; i++) GROUP_PE_DONE[g][i] = 0; /* 0 = not done */
      }
  
-     /* Root’s per-group record (retained for compatibility; H-STAR doesn't use it). */
+     /* Root’s per-group record (retained for compatibility). */
      ROOT_GROUP_DONE = shmem_malloc(sizeof(int) * NUM_GROUPS0);
      if (!ROOT_GROUP_DONE) shmem_global_exit(1);
      for (int g = 0; g < NUM_GROUPS0; g++) ROOT_GROUP_DONE[g] = 0;
  
-     /* Global termination flag */
-     GLOBAL_TERMINATION_READY = shmem_malloc(sizeof(int));
-     if (!GLOBAL_TERMINATION_READY) shmem_global_exit(1);
-     *GLOBAL_TERMINATION_READY = 0;
- 
-     /* H-STAR: allocate per-level child mailboxes and per-level broadcast tokens. */
+     /* Per-level child mailboxes. */
      LVL_CHILD_DONE = shmem_malloc(sizeof(int**) * LEVELS);
-     LVL_BCAST_TOKEN = shmem_malloc(sizeof(int*) * LEVELS);
-     if (!LVL_CHILD_DONE || !LVL_BCAST_TOKEN) shmem_global_exit(1);
+     if (!LVL_CHILD_DONE) shmem_global_exit(1);
  
      for (int l = 0; l < LEVELS; l++) {
          const int groups = NUM_GROUPS[l];
@@ -173,19 +163,10 @@
              if (!LVL_CHILD_DONE[l][g]) shmem_global_exit(1);
              for (int i = 0; i < cap; i++) LVL_CHILD_DONE[l][g][i] = 0;
          }
- 
-         /* downward token: one int per group, initialized to 0 */
-         LVL_BCAST_TOKEN[l] = shmem_malloc(sizeof(int) * groups);
-         if (!LVL_BCAST_TOKEN[l]) shmem_global_exit(1);
-         for (int g = 0; g < groups; g++) LVL_BCAST_TOKEN[l][g] = 0;
      }
  
-     /* H-STAR: alias level-0 child-done to the original name for readability. */
-     /* (No change in usage style at the leaf.) */
+     /* alias level-0 to original buffers for readability */
      for (int g = 0; g < NUM_GROUPS0; g++) {
-         /* GROUP_PE_DONE[g] already allocated above; ensure LVL view points to it. */
-         /* We reassign the level-0 pointer to reuse the same buffers. */
-         /* (This keeps leaf-level code intuitive.) */
          LVL_CHILD_DONE[0][g] = GROUP_PE_DONE[g];
      }
  }
@@ -195,7 +176,7 @@
      const int me   = shmem_my_pe();
      const int npes = shmem_n_pes();
  
-     /* ----- local completion (unchanged) ----- */
+     /* ----- local completion ----- */
      const int g0   = me / G_LEAF;          /* my leaf group */
      const int idx0 = me % G_LEAF;          /* index within leaf group */
      const int own0 = static_group_owner_pe(G_LEAF, /*level=*/0, g0);
@@ -249,13 +230,8 @@
          }
      }
  
-     /* ----- root proves completion and starts downward broadcast ----- */
+     /* ----- root aggregates and exits immediately ----- */
      if (me == ROOT_PE) {
-         /* At the top level, there is exactly 1 group: g = 0. */
-         const int top_l = LEVELS - 1;
-         const int top_g = 0;
- 
-         /* Optional: aggregate timing like STAR (same style). */
          double sum = 0.0, minv = 0.0, maxv = 0.0;
          for (int pe = 0; pe < npes; pe++) {
              double val = (pe == me) ? *ELAPSED_MS : shmem_double_g(ELAPSED_MS, pe);
@@ -265,63 +241,12 @@
              sum += val;
          }
          double avg = sum / (double)npes;
-         printf("ELAPSED_MS across %d PEs: min=%.3f ms  avg=%.3f ms  max=%.3f ms\n",
+ 
+         printf("Aggregated ELAPSED_MS across %d PEs: min=%.3f ms  avg=%.3f ms  max=%.3f ms\n",
                 npes, minv, avg, maxv);
          fflush(stdout);
  
-         /* H-STAR: seed the tree broadcast by setting the top group's token. */
-         LVL_BCAST_TOKEN[top_l][top_g] = -1; /* local store at root owner */
-     }
- 
-     /* ----- downward fan-out as a tree (owners forward tokens) ----- */
-     /* Owners at each level wait on their token, then forward to children owners (or PEs at leaf). */
-     for (int l = LEVELS - 1; l >= 0; l--) {
-         const int span_l  = group_span_at_level(G_LEAF, l);
-         const int g_l     = me / span_l;
-         const int owner_l = static_group_owner_pe(G_LEAF, l, g_l);
- 
-         if (me == owner_l) {
-             /* Wait until my group's token is set by my parent (or root). */
-             shmem_int_wait_until(&LVL_BCAST_TOKEN[l][g_l], SHMEM_CMP_EQ, -1);
- 
-             if (l > 0) {
-                 /* Forward to child owners at level (l-1). */
-                 const int groups_below = NUM_GROUPS[l-1];
-                 const int first_child  = g_l * K;
-                 int gsize = (first_child + K <= groups_below) ? K : (groups_below - first_child);
-                 if (gsize < 0) gsize = 0;
- 
-                 for (int c = 0; c < gsize; c++) {
-                     const int child_g     = first_child + c;
-                     const int child_owner = static_group_owner_pe(G_LEAF, l - 1, child_g);
-                     shmem_int_p(&LVL_BCAST_TOKEN[l - 1][child_g], -1, child_owner);
-                 }
-                 shmem_quiet();
-             } else {
-                 /* Leaf owners: set each member PE's per-PE gate. */
-                 int start = owner_l;
-                 int end   = start + G_LEAF;
-                 if (end > npes) end = npes;
-                 for (int pe = start; pe < end; pe++) {
-                     if (pe == owner_l) {
-                         *GLOBAL_TERMINATION_READY = -1; /* local store for owner */
-                     } else {
-                         shmem_int_p(GLOBAL_TERMINATION_READY, -1, pe);
-                     }
-                 }
-                 shmem_quiet();
-             }
-         }
-     }
- 
-     /* ----- all PEs wait for the global gate, then finalize (unchanged) ----- */
-     shmem_int_wait_until(GLOBAL_TERMINATION_READY, SHMEM_CMP_EQ, -1);
-     shmem_barrier_all();
- 
-     if (me == ROOT_PE) {
-         const int np = shmem_n_pes();
-         printf("ALL_CLEAR: all %d PEs observed termination and reached the final barrier.\n", np);
-         fflush(stdout);
+         shmem_global_exit(0);
      }
  }
  
@@ -334,7 +259,7 @@
  
      g_debug = env_debug_enabled();
      G_LEAF  = env_group_size();
-     K       = env_branch_k();            /* H-STAR: branch factor from env (GLOBAL_BRANCH_K) */
+     K       = env_branch_k();            /* branch factor from env (GLOBAL_BRANCH_K) */
  
      /* Align start for timing; not required for logic */
      shmem_barrier_all();
@@ -348,7 +273,7 @@
      *LOCAL_DONE = 0;
      *ELAPSED_MS = 0.0;
  
-     allocate_star_flags(npes);            /* H-STAR: function retained, extended internally */
+     allocate_star_flags(npes);
  
      if (g_debug && me == 0) {
          printf("[DEBUG] npes=%d, leaf_size=%d, K=%d, levels=%d, num_groups[0]=%d\n",
@@ -356,9 +281,10 @@
          fflush(stdout);
      }
  
-     /* Run H-STAR termination */
+     /* Root exits the job immediately on proof of global completion */
      run_hstar_termination();
  
+     /* If root did not exit (unexpected), finalize gracefully. */
      shmem_finalize();
      return 0;
  }
