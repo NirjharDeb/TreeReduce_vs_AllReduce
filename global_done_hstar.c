@@ -278,10 +278,6 @@
      G_LEAF  = env_group_size();
      K       = env_branch_k();            /* branch factor from env (GLOBAL_BRANCH_K) */
  
-     /* Align start for timing; not required for logic */
-     shmem_barrier_all();
-     g_start_time = now_sec();
- 
      /* Symmetric allocations (local bookkeeping + H-STAR flags) */
      LOCAL_DONE = shmem_malloc(sizeof(int));
      ELAPSED_MS = shmem_malloc(sizeof(double));
@@ -291,6 +287,10 @@
      *ELAPSED_MS = 0.0;
  
      allocate_star_flags(npes);
+ 
+     /* Align start for timing; not required for logic */
+     shmem_barrier_all();
+     g_start_time = now_sec();
  
      if (g_debug && me == 0) {
          printf("[DEBUG] npes=%d, leaf_size=%d, K=%d, levels=%d, num_groups[0]=%d\n",
