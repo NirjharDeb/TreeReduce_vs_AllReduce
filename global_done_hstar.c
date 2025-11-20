@@ -136,10 +136,16 @@
      /* Level-0 per-group per-member flags at group anchors (as before). */
      GROUP_PE_DONE = shmem_malloc(sizeof(int*) * NUM_GROUPS0);
      if (!GROUP_PE_DONE) shmem_global_exit(1);
+ 
+     /* single backing block for all leaf-group flags: [NUM_GROUPS0][G_LEAF] */
+     int *leaf_backing = shmem_malloc(sizeof(int) * NUM_GROUPS0 * G_LEAF);
+     if (!leaf_backing) shmem_global_exit(1);
+ 
      for (int g = 0; g < NUM_GROUPS0; g++) {
-         GROUP_PE_DONE[g] = shmem_malloc(sizeof(int) * G_LEAF);
-         if (!GROUP_PE_DONE[g]) shmem_global_exit(1);
-         for (int i = 0; i < G_LEAF; i++) GROUP_PE_DONE[g][i] = 0; /* 0 = not done */
+         GROUP_PE_DONE[g] = leaf_backing + g * G_LEAF;
+         for (int i = 0; i < G_LEAF; i++) {
+             GROUP_PE_DONE[g][i] = 0; /* 0 = not done */
+         }
      }
  
      /* Root’s per-group record (retained for compatibility). */
@@ -158,10 +164,21 @@
          /* child mailboxes: [groups][cap], initialized to 0 */
          LVL_CHILD_DONE[l] = shmem_malloc(sizeof(int*) * groups);
          if (!LVL_CHILD_DONE[l]) shmem_global_exit(1);
+ 
+         if (l == 0) {
+             /* level-0 will alias GROUP_PE_DONE below */
+             continue;
+         }
+ 
+         /* one backing block for level-l children: [groups][cap] */
+         int *backing = shmem_malloc(sizeof(int) * groups * cap);
+         if (!backing) shmem_global_exit(1);
+ 
          for (int g = 0; g < groups; g++) {
-             LVL_CHILD_DONE[l][g] = shmem_malloc(sizeof(int) * cap);
-             if (!LVL_CHILD_DONE[l][g]) shmem_global_exit(1);
-             for (int i = 0; i < cap; i++) LVL_CHILD_DONE[l][g][i] = 0;
+             LVL_CHILD_DONE[l][g] = backing + g * cap;
+             for (int i = 0; i < cap; i++) {
+                 LVL_CHILD_DONE[l][g][i] = 0;
+             }
          }
      }
  
@@ -170,7 +187,7 @@
          LVL_CHILD_DONE[0][g] = GROUP_PE_DONE[g];
      }
  }
- 
+
  /* ---------- H-STAR termination protocol ---------- */
  static void run_hstar_termination(void) {
      const int me   = shmem_my_pe();
