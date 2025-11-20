@@ -40,6 +40,7 @@
  static int     NUM_GROUPS0 = 0;            /* number of groups at leaf granularity */
  static int     g_debug = 0;
  static double  g_start_time = 0.0;
+ static double  g_term_start = 0.0;
  static const int ROOT_PE = 0;
  
  /* Per-group, per-member completion flags at the group's anchor:
@@ -187,7 +188,7 @@
          LVL_CHILD_DONE[0][g] = GROUP_PE_DONE[g];
      }
  }
-
+ 
  /* ---------- H-STAR termination protocol ---------- */
  static void run_hstar_termination(void) {
      const int me   = shmem_my_pe();
@@ -249,6 +250,8 @@
  
      /* ----- root aggregates and exits immediately ----- */
      if (me == ROOT_PE) {
+         double term_ms = (now_sec() - g_term_start) * 1e3;
+ 
          double sum = 0.0, minv = 0.0, maxv = 0.0;
          for (int pe = 0; pe < npes; pe++) {
              double val = (pe == me) ? *ELAPSED_MS : shmem_double_g(ELAPSED_MS, pe);
@@ -259,6 +262,7 @@
          }
          double avg = sum / (double)npes;
  
+         printf("H-STAR termination latency: %.3f ms\n", term_ms);
          printf("Aggregated ELAPSED_MS across %d PEs: min=%.3f ms  avg=%.3f ms  max=%.3f ms\n",
                 npes, minv, avg, maxv);
          fflush(stdout);
@@ -291,6 +295,7 @@
      /* Align start for timing; not required for logic */
      shmem_barrier_all();
      g_start_time = now_sec();
+     g_term_start = g_start_time;
  
      if (g_debug && me == 0) {
          printf("[DEBUG] npes=%d, leaf_size=%d, K=%d, levels=%d, num_groups[0]=%d\n",

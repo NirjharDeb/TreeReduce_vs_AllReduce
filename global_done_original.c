@@ -37,6 +37,7 @@
  
  /* Globals */
  static double g_start_time = 0.0;
+ static double g_term_start = 0.0;
  static int    g_debug = 0;   /* 0 = quiet (default), 1 = verbose */
  static const int ROOT_PE = 0;
  
@@ -98,6 +99,8 @@
  
      /* if all LOCAL_DONE == (-1)*npes then can (safely) invoke global termination */
      if (global_done_flag == (-1 * npes)) {
+         double term_ms = (now_sec() - g_term_start) * 1e3;
+ 
          /* Debug-only per-PE detection print */
          if (g_debug) {
              printf("PE %d detected all-done: scanned=%d, remote_gets=%d\n",
@@ -125,6 +128,7 @@
          }
  
          if (should_print_aggregate) {
+             printf("Original termination latency: %.3f ms\n", term_ms);
              printf("Aggregated ELAPSED_MS across %d PEs: min=%.3f ms  avg=%.3f ms  max=%.3f ms\n",
                     npes, min, avg, max);
              fflush(stdout);
@@ -159,6 +163,10 @@
      /* Only the root's AGG_PRINTED governs the first-writer-wins behavior.
         Initialize to 0 on all PEs (root is authoritative for the atomic CAS). */
      *AGG_PRINTED = 0;
+ 
+     /* Align start for termination timing (after setup) */
+     shmem_barrier_all();
+     g_term_start = now_sec();
  
      /* Each PE calls initiate_global_done(); whichever detects will terminate all */
      initiate_global_done();
